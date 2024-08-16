@@ -7,26 +7,165 @@
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     -->
     <title>Resource Listing</title>
-    <script src="https://scotwatson.github.io/WebInterface/init.js"></script>
-    <script>
-const selfURL = new URL(window.location);
-const pathSegments = selfURL.pathname.split("/");
-init({
-  latestVersion: "20240508",
-  siteURI: function () {
-    return selfURL.origin + pathSegments[0] + "/index";
-  },
-});
-// Obtain initialization info
-const urlSelf = new URL(self.location);
-const urlServiceWorker = new URL("./sw.js", urlSelf);
-const urlServiceWorkerScope = new URL("./", urlSelf);
-    </script>
-    <link rel="shortcut icon" href="./favicon.ico" type="image/x-icon">
-    <link rel="icon" href="./favicon.ico" type="image/x-icon">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex, nofollow">
+    <style>
+@keyframes loading {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+    </style>
+    <!-- window-init.js must be loaded classically to ensure capture of page load events -->
+    <script id="Init" src="https://scotwatson.github.io/WebInterface/window-init.js"></script>
+    <!-- MessageQueue.js must be loaded classically to ensure capture of page load events -->
+    <script id="MessageQueue" src="https://scotwatson.github.io/WebInterface/MessageQueue.js"></script>
   </head>
   <body>
+    <script>
+const appLoading = document.createElement("p");
+appLoading.style.fontSize = "24pt";
+appLoading.style.animation = "loading 1s";
+appLoading.innerHTML = "Loading App...";
+document.body.append(appLoading);
+const appError = document.createElement("p");
+appError.style.display = "none";
+appError.innerHTML = "This app has encountered an error and has to close";
+document.body.append(appError);
+const Init = document.getElementById("Init").exports;
+const MessageQueue = document.getElementById("MessageQueue").exports.default;
+Init.createQueues(MessageQueue);
+const serviceWorkerUrl = new URL("./sw.js", Init.selfUrl);
+const serviceWorkerScope = new URL("./", Init.selfUrl);
+//IIFE to prevent polluting the global namespace
+(() => {
+  const pathSegments = Init.selfUrl.pathname.split("/");
+  if (pathSegments.length !== 0) {
+    pathSegments[pathSegments.length - 1] = "";
+  }
+  const scopeURI = Init.selfUrl.origin + pathSegments.join("/");
+  (async () => {
+    function getRequestedVersion() {
+      const version = Init.selfUrl.searchParams.get("version");
+      Init.selfUrl.searchParams.delete("version")
+      window.history.replaceState(null, "", Init.selfUrl);
+      return version;
+    }
+    async function getStoredVersion() {
+      const SiteStorage = (await import("https://scotwatson.github.io/WebInterface/SiteStorage.mjs")).default;
+      const scopedSessionStorage = new SiteStorage({
+        uri: scopeURI,
+        storage: window.sessionStorage,
+      });
+      return scopedSessionStorage.get("version");
+    }
+    async function getLatestVersion() {
+      async function installServiceWorker(ServiceWorkers) {
+        const newestWorker = await (async () => {
+          const installing = await ServiceWorkers.getInstalling();
+          if (installing) {
+            return installing;
+          }
+          const waiting = await ServiceWorkers.getWaiting();
+          if (waiting) {
+            return waiting;
+          }
+          const active = await ServiceWorkers.getActive();
+          if (active) {
+            return active;
+          }
+          return await ServiceWorkers.installNew({
+            url: serviceWorkerUrl,
+            scope: serviceWorkerScope,
+          });
+        })();
+        await (async () => {
+          let newestWorkerInstalled = false;
+          const fail = newestWorker.redundant.then(() => {
+            if (!newestWorkerInstalled) {
+              console.log("Newest Service Worker failed to install.");
+              throw Error("Newest Service Worker failed to install.");
+            }
+          });
+          newestWorker.installed.then(() => {
+            newestWorkerInstalled = true;
+          });
+          newestWorker.activating.then(() => {
+            newestWorker.input.callback("claimClients");
+            newestWorker.input.unlock();
+          });
+          await Promise.race([ Init.controller.then(() => {
+            console.log("Init.controller");
+            console.log(newestWorker.state);
+            console.log(self.navigator.serviceWorker.controller);
+          }), fail.then(() => { console.log("fail then"); }, () => { console.log("fail catch"); }) ]);
+        })();
+        return ServiceWorkers;
+      }
+      const [ ServiceWorkers, Streams, RPCNode ] = await Promise.all([
+        import("https://scotwatson.github.io/WebInterface/service-workers.mjs").then(installServiceWorker),
+        import("https://scotwatson.github.io/WebInterface/streams.mjs"),
+        import("https://scotwatson.github.io/WebInterface/RPCNode.mjs").then((x) => { return x.default; }),
+      ]);
+      const controllerSource = ServiceWorkers.createControllerSource(Init.controllerMessages);
+      const controllerRPCNode = new RPCNode({});
+      const inputPipe = new Streams.Pipe(controllerSource, controllerRPCNode.input);
+      inputPipe.catch((e) => {
+        console.log("Error on controller input pipe in window");
+        console.error(e);
+      });
+      const outputPipe = new Streams.Pipe(controllerRPCNode.output, ServiceWorkers.controllerSink);
+      outputPipe.catch((e) => {
+        console.log("Error on controller output pipe in window");
+        console.error(e);
+      });
+      Init.controllerMessages.start();
+      return await controllerRPCNode.call({
+        verb: "getVersion",
+        args: {}
+      }).then((version) => {
+        inputPipe.return();
+        outputPipe.return();
+        Init.controllerMessages.stop();
+        return version;
+      });
+    }
+    try {
+      const [ requestedVersion, storedVersion, latestVersion ] = await Promise.all([ getRequestedVersion(), getStoredVersion(), getLatestVersion() ]);
+      const version = (() => {
+        if (requestedVersion) { return requestedVersion; }
+        if (storedVersion) { return storedVersion; }
+        return latestVersion;
+      })();
+      const versionBaseUrl = new URL("./" + version + "/", Init.selfUrl);
+      await import("https://scotwatson.github.io/WebInterface/resources.mjs").then(async (Resources) => {
+        Resources.addStyleSheet(new URL("./style.css", versionBaseUrl)),
+        Resources.addShortcutIcon(new URL("./favicon.ico", Init.selfUrl)),
+        Resources.addIcon(new URL("./favicon.ico", Init.selfUrl)),
+        await Promise.all([
+          Resources.addScript({
+            url: new URL("./index.js", versionBaseUrl),
+            defer: true,
+            asModule: true,
+          }).loading,
+        ]).then(() => {
+          appLoading.style.display = "none";
+          appError.style.display = "none";
+        }, (e) => {
+          console.log("Error on loading index.js");
+          console.error(e);
+        });
+      });
+    } catch (e) {
+      console.error(e);
+      appLoading.style.display = "none";
+      appError.style.display = "block";
+    }
+  })();
+})();
+    </script>
   </body>
 </html>
