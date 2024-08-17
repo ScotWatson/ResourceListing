@@ -65,17 +65,9 @@ const serviceWorkerScope = new URL("./", Init.selfUrl);
     async function getLatestVersion() {
       async function installServiceWorker(ServiceWorkers) {
         const newestWorker = await (async () => {
-          const installing = await ServiceWorkers.getInstalling();
+          const installing = await ServiceWorkers.getNewest();
           if (installing) {
             return installing;
-          }
-          const waiting = await ServiceWorkers.getWaiting();
-          if (waiting) {
-            return waiting;
-          }
-          const active = await ServiceWorkers.getActive();
-          if (active) {
-            return active;
           }
           return await ServiceWorkers.installNew({
             url: serviceWorkerUrl,
@@ -84,54 +76,34 @@ const serviceWorkerScope = new URL("./", Init.selfUrl);
         })();
         await (async () => {
           let newestWorkerInstalled = false;
-          const fail = newestWorker.redundant.then(() => {
-            if (!newestWorkerInstalled) {
-              console.log("Newest Service Worker failed to install.");
-              throw Error("Newest Service Worker failed to install.");
-            }
-          });
           newestWorker.installed.then(() => {
             newestWorkerInstalled = true;
           });
+          // Once a service worker has started activating, it cannot fail.
+          // Send "claimClients" command to make the active worker the controller.
+          // This overrides the default Ctrl-R behavior.
           newestWorker.activating.then(() => {
-            newestWorker.input.callback("claimClients");
-            newestWorker.input.unlock();
+            newestWorker.input("claimClients");
           });
-          await Promise.race([ Init.controller.then(() => {
-            console.log("Init.controller");
-            console.log(newestWorker.state);
-            console.log(self.navigator.serviceWorker.controller);
-          }), fail.then(() => { console.log("fail then"); }, () => { console.log("fail catch"); }) ]);
+          await Promise.race([ Init.controller.next().then(() => {
+            // controller installed
+          }), newestWorker.redundant.then(() => {
+            if (!newestWorkerInstalled) {
+              console.error("Newest Service Worker failed to install.");
+              throw Error("Newest Service Worker failed to install.");
+            }
+          }) ]);
         })();
         return ServiceWorkers;
       }
-      const [ ServiceWorkers, Streams, RPCNode ] = await Promise.all([
-        import("https://scotwatson.github.io/WebInterface/service-workers.mjs").then(installServiceWorker),
-        import("https://scotwatson.github.io/WebInterface/streams.mjs"),
-        import("https://scotwatson.github.io/WebInterface/RPCNode.mjs").then((x) => { return x.default; }),
-      ]);
+      const ServiceWorkers = import("https://scotwatson.github.io/WebInterface/service-workers.mjs").then(installServiceWorker);
       const controllerSource = ServiceWorkers.createControllerSource(Init.controllerMessages);
-      const controllerRPCNode = new RPCNode({});
-      const inputPipe = new Streams.Pipe(controllerSource, controllerRPCNode.input);
-      inputPipe.catch((e) => {
-        console.log("Error on controller input pipe in window");
-        console.error(e);
-      });
-      const outputPipe = new Streams.Pipe(controllerRPCNode.output, ServiceWorkers.controllerSink);
-      outputPipe.catch((e) => {
-        console.log("Error on controller output pipe in window");
-        console.error(e);
-      });
-      Init.controllerMessages.start();
-      return await controllerRPCNode.call({
-        verb: "getVersion",
-        args: {}
-      }).then((version) => {
-        inputPipe.return();
-        outputPipe.return();
+      newestWorker.input("getVersion");
+      return controllerSource[Symbol.asyncIterator].next().then((version) => {
         Init.controllerMessages.stop();
         return version;
       });
+      Init.controllerMessages.start();
     }
     try {
       const [ requestedVersion, storedVersion, latestVersion ] = await Promise.all([ getRequestedVersion(), getStoredVersion(), getLatestVersion() ]);
