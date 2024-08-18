@@ -21,7 +21,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
     </style>
     <!-- window-init.js must be loaded classically to ensure capture of page load events -->
     <script id="Init" src="https://scotwatson.github.io/WebInterface/window-init.js"></script>
-    <!-- MessageQueue.js must be loaded classically to ensure capture of page load events -->
+    <!-- MessageQueue.js must be loaded classically to ensure capture of initial message events -->
     <script id="MessageQueue" src="https://scotwatson.github.io/WebInterface/MessageQueue.js"></script>
   </head>
   <body>
@@ -47,89 +47,85 @@ const serviceWorkerScope = new URL("./", Init.selfUrl);
     pathSegments[pathSegments.length - 1] = "";
   }
   const scopeURI = Init.selfUrl.origin + pathSegments.join("/");
-  (async () => {
-    function getRequestedVersion() {
-      const version = Init.selfUrl.searchParams.get("version");
-      Init.selfUrl.searchParams.delete("version")
-      window.history.replaceState(null, "", Init.selfUrl);
-      return version;
-    }
-    async function getStoredVersion() {
-      const SiteStorage = (await import("https://scotwatson.github.io/WebInterface/SiteStorage.mjs")).default;
-      const scopedSessionStorage = new SiteStorage({
-        uri: scopeURI,
-        storage: window.sessionStorage,
-      });
-      return scopedSessionStorage.get("version");
-    }
-    async function getLatestVersion() {
-      async function installServiceWorker(ServiceWorkers) {
-        const newestWorker = await (async () => {
-          const installing = await ServiceWorkers.getNewest();
-          if (installing) {
-            return installing;
-          }
-          return await ServiceWorkers.installNew({
-            url: serviceWorkerUrl,
-            scope: serviceWorkerScope,
-          });
-        })();
-        await (async () => {
-          let newestWorkerInstalled = false;
-          newestWorker.installed.then(() => {
-            newestWorkerInstalled = true;
-          });
-          // Once a service worker has started activating, it cannot fail.
-          // Send "claimClients" command to make the active worker the controller.
-          // This overrides the default Ctrl-R behavior.
-          newestWorker.activating.then(() => {
-            newestWorker.input("claimClients");
-          });
-          await Promise.race([ Init.controller.next().then(() => {
-            // controller installed
-          }), newestWorker.redundant.then(() => {
-            if (!newestWorkerInstalled) {
-              console.error("Newest Service Worker failed to install.");
-              throw Error("Newest Service Worker failed to install.");
-            }
-          }) ]);
-        })();
-        return ServiceWorkers;
-      }
-      const ServiceWorkers = import("https://scotwatson.github.io/WebInterface/service-workers.mjs").then(installServiceWorker);
-      const controllerSource = ServiceWorkers.createControllerSource(Init.controllerMessages);
-      newestWorker.input("getVersion");
-      return controllerSource[Symbol.asyncIterator].next().then((version) => {
-        Init.controllerMessages.stop();
-        return version;
-      });
-      Init.controllerMessages.start();
-    }
+  const controllerInstalled = (async () => {
+    const ServiceWorkers = await import("https://scotwatson.github.io/WebInterface/service-workers.mjs");
     try {
-      const [ requestedVersion, storedVersion, latestVersion ] = await Promise.all([ getRequestedVersion(), getStoredVersion(), getLatestVersion() ]);
-      const version = (() => {
-        if (requestedVersion) { return requestedVersion; }
-        if (storedVersion) { return storedVersion; }
-        return latestVersion;
-      })();
-      const versionBaseUrl = new URL("./" + version + "/", Init.selfUrl);
-      await import("https://scotwatson.github.io/WebInterface/resources.mjs").then(async (Resources) => {
-        Resources.addStyleSheet(new URL("./style.css", versionBaseUrl)),
-        Resources.addShortcutIcon(new URL("./favicon.ico", Init.selfUrl)),
-        Resources.addIcon(new URL("./favicon.ico", Init.selfUrl)),
-        await Promise.all([
-          Resources.addScript({
-            url: new URL("./index.js", versionBaseUrl),
-            defer: true,
-            asModule: true,
-          }).loading,
-        ]).then(() => {
-          appLoading.style.display = "none";
-          appError.style.display = "none";
-        }, (e) => {
-          console.log("Error on loading index.js");
-          console.error(e);
+      await ServiceWorkers.attemptController();
+    } catch (e) {
+      await ServiceWorkers.installNew({
+        url: serviceWorkerUrl,
+        scope: serviceWorkerScope,
+      });
+      await ServiceWorkers.attemptController();
+    }
+    return ServiceWorkers;
+  })();
+  const getVersion = async () => {
+    async function getLocalVersion() {
+      let version = getRequestedVersion();
+      if (version) {
+        return version;
+      }
+      version = getStoredVersion();
+      if (version) {
+        return version;
+      }
+      function getRequestedVersion() {
+        const version = Init.selfUrl.searchParams.get("version");
+        Init.selfUrl.searchParams.delete("version")
+        window.history.replaceState(null, "", Init.selfUrl);
+        return version;
+      }
+      async function getStoredVersion() {
+        const SiteStorage = (await import("https://scotwatson.github.io/WebInterface/SiteStorage.mjs")).default;
+        const scopedSessionStorage = new SiteStorage({
+          uri: scopeURI,
+          storage: window.sessionStorage,
         });
+        return scopedSessionStorage.get("version");
+      }
+    }
+    const [ localVersion, ServiceWorkers ] = await Promise.all([ getLocalVersion(), controllerInstalled ]);
+    if (localVersion) {
+      return localVersion;
+    }
+    return await getLatestVersion();
+    async function getLatestVersion() {
+      const MessageNode = await import("https://scotwatson.github.io/WebInterface/message-node.mjs");
+      const controllerSource = MessageNode.forMessagePort(Init.controllerMessages).output;
+      ServiceWorkers.controllerInput("getVersion");
+      const getVersion = (async () => {
+        for (await message of controllerSource) {
+          if (messsage.request === "getVersion") {
+            Init.controllerMessages.stop();
+            return message.response;
+          }
+        }
+      })();
+      Init.controllerMessages.start();
+      return await getVersion;
+    }
+  };
+  (async () => {
+    try {
+      const version  = await getVersion();
+      const versionBaseUrl = new URL("./" + version + "/", Init.selfUrl);
+      const Resources = await import("https://scotwatson.github.io/WebInterface/resources.mjs");
+      Resources.addStyleSheet(new URL("./style.css", versionBaseUrl)),
+      Resources.addShortcutIcon(new URL("./favicon.ico", Init.selfUrl)),
+      Resources.addIcon(new URL("./favicon.ico", Init.selfUrl)),
+      await Promise.all([
+        Resources.addScript({
+          url: new URL("./index.js", versionBaseUrl),
+          defer: true,
+          asModule: true,
+        }).loading,
+      ]).then(() => {
+        appLoading.style.display = "none";
+        appError.style.display = "none";
+      }, (e) => {
+        console.log("Error on loading index.js");
+        console.error(e);
       });
     } catch (e) {
       console.error(e);
